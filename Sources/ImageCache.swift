@@ -77,7 +77,7 @@ open class ImageCache {
 
     //Memory
     fileprivate let memoryCache = NSCache<NSString, AnyObject>()
-    
+    fileprivate let cacheMonitor = EvictionMonitor()
     /// The largest cache cost of memory cache. The total cost is pixel count of 
     /// all cached images in memory.
     /// Default is unlimited. Memory cache will be purged automatically when a 
@@ -89,8 +89,8 @@ open class ImageCache {
     }
     
     //Disk
-    fileprivate let ioQueue: DispatchQueue
-    fileprivate var fileManager: FileManager!
+	fileprivate let ioQueue: DispatchQueue
+    fileprivate var fileManager: FileManager
     
     ///The disk cache location.
     public let diskCachePath: String
@@ -107,7 +107,10 @@ open class ImageCache {
     /// allocated size of cached files in bytes.
     /// Default is no limit.
     open var maxDiskCacheSize: UInt = 0
-    
+	
+	fileprivate let readOperations = OperationQueue()
+	fileprivate let writeOperations = OperationQueue()
+	fileprivate let processOperations = OperationQueue()
     fileprivate let processQueue: DispatchQueue
     
     /// The default cache.
@@ -143,17 +146,18 @@ open class ImageCache {
         
         let cacheName = "com.onevcat.Kingfisher.ImageCache.\(name)"
         memoryCache.name = cacheName
+		memoryCache.totalCostLimit = 100000
+		memoryCache.delegate = cacheMonitor
+		print(memoryCache.totalCostLimit)
         
         diskCachePath = diskCachePathClosure(path, cacheName)
-        
-        let ioQueueName = "com.onevcat.Kingfisher.ImageCache.ioQueue.\(name)"
-        ioQueue = DispatchQueue(label: ioQueueName)
-        
+		
         let processQueueName = "com.onevcat.Kingfisher.ImageCache.processQueue.\(name)"
         processQueue = DispatchQueue(label: processQueueName, attributes: .concurrent)
         
-        ioQueue.sync { fileManager = FileManager() }
-        
+        fileManager = FileManager()
+		let ioQueueName = "com.onevcat.Kingfisher.ImageCache.ioQueue.\(name)"
+		ioQueue = DispatchQueue(label: ioQueueName)
 #if !os(macOS) && !os(watchOS)
         NotificationCenter.default.addObserver(
             self, selector: #selector(clearMemoryCache), name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
@@ -162,11 +166,13 @@ open class ImageCache {
         NotificationCenter.default.addObserver(
             self, selector: #selector(backgroundCleanExpiredDiskCache), name: UIApplication.didEnterBackgroundNotification, object: nil)
 #endif
+
     }
     
     deinit {
         NotificationCenter.default.removeObserver(self)
     }
+
 
 
     // MARK: - Store & Remove
@@ -194,20 +200,19 @@ open class ImageCache {
                       toDisk: Bool = true,
                       completionHandler: (() -> Void)? = nil)
     {
-        
+		defer {
+			if let handler = completionHandler {
+				DispatchQueue.main.async {
+					handler()
+				}
+			}
+		}
+		
         let computedKey = key.computedKey(with: identifier)
         memoryCache.setObject(image, forKey: computedKey as NSString, cost: image.kf.imageCost)
-
-        func callHandlerInMainQueue() {
-            if let handler = completionHandler {
-                DispatchQueue.main.async {
-                    handler()
-                }
-            }
-        }
         
         if toDisk {
-            ioQueue.async {
+            writeOperations.addOperation {
                 
                 if let data = serializer.data(with: image, original: original) {
                     if !self.fileManager.fileExists(atPath: self.diskCachePath) {
@@ -218,10 +223,7 @@ open class ImageCache {
                     
                     self.fileManager.createFile(atPath: self.cachePath(forComputedKey: computedKey), contents: data, attributes: nil)
                 }
-                callHandlerInMainQueue()
             }
-        } else {
-            callHandlerInMainQueue()
         }
     }
     
@@ -257,7 +259,7 @@ open class ImageCache {
         }
         
         if fromDisk {
-            ioQueue.async{
+            writeOperations.addOperation {
                 do {
                     try self.fileManager.removeItem(atPath: self.cachePath(forComputedKey: computedKey))
                 } catch _ {}
@@ -291,7 +293,6 @@ open class ImageCache {
             return nil
         }
         
-        var block: RetrieveImageDiskTask?
         let options = options ?? KingfisherEmptyOptionsInfo
         let imageModifier = options.imageModifier
 
@@ -304,16 +305,16 @@ open class ImageCache {
                 completionHandler(nil, .none)
             }
         } else {
-            var sSelf: ImageCache! = self
-            block = DispatchWorkItem(block: {
+			let block: RetrieveImageDiskTask = DispatchWorkItem(block: { [weak self] in
+				guard let `self` = self else { return }
                 // Begin to load image from disk
-                if let image = sSelf.retrieveImageInDiskCache(forKey: key, options: options) {
+                if let image = self.retrieveImageInDiskCache(forKey: key, options: options) {
                     if options.backgroundDecode {
-                        sSelf.processQueue.async {
+						self.processOperations.addOperation {
 
                             let result = image.kf.decoded
                             
-                            sSelf.store(result,
+                            self.store(result,
                                         forKey: key,
                                         processorIdentifier: options.processor.identifier,
                                         cacheSerializer: options.cacheSerializer,
@@ -321,11 +322,10 @@ open class ImageCache {
                                         completionHandler: nil)
                             options.callbackDispatchQueue.safeAsync {
                                 completionHandler(imageModifier.modify(result), .disk)
-                                sSelf = nil
                             }
                         }
                     } else {
-                        sSelf.store(image,
+                        self.store(image,
                                     forKey: key,
                                     processorIdentifier: options.processor.identifier,
                                     cacheSerializer: options.cacheSerializer,
@@ -334,22 +334,21 @@ open class ImageCache {
                         )
                         options.callbackDispatchQueue.safeAsync {
                             completionHandler(imageModifier.modify(image), .disk)
-                            sSelf = nil
                         }
                     }
                 } else {
                     // No image found from either memory or disk
                     options.callbackDispatchQueue.safeAsync {
                         completionHandler(nil, .none)
-                        sSelf = nil
                     }
                 }
             })
-            
-            sSelf.ioQueue.async(execute: block!)
+			readOperations.addOperation {
+				block.perform()
+			}
         }
-    
-        return block
+		
+        return nil
     }
     
     /**
@@ -724,4 +723,10 @@ extension String {
             return appending("@\(identifier)")
         }
     }
+}
+
+class EvictionMonitor: NSObject, NSCacheDelegate {
+	public func cache(_ cache: NSCache<AnyObject, AnyObject>, willEvictObject obj: Any) {
+		print("evicting: \(obj)")
+	}
 }
